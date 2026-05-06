@@ -1,9 +1,9 @@
-# This code controls the stepper motors and reads the MV2 data through separate serial ports. 
-
-# Functions
+# This code controls the stepper motors and reads the MV2 data through separate serial ports.
+#
+# Modes:
 # setup mode: manual terminal inputs to control the stepper motors.
-# run mode: runs a predefined sequence of stepper motor movements while logging MV2 data to a new CSV each run.
-# manual mode: allows the user to input stepper motor commands in real-time while logging MV2 data.(not to CSV, just print to terminal)
+# manual mode: allows motor commands and averaged MV2 readouts.
+# auto sweep mode: runs a predefined sequence of motor movements while logging averaged MV2 data to CSV.
 
 import csv
 import time
@@ -13,14 +13,18 @@ from pathlib import Path
 import serial
 
 
-
-STEPPER_PORT = "/dev/cu.usbmodem101"  # match this to my port
-MV2_PORT = "/dev/cu.usbmodem11101"  # match this to my port
+STEPPER_PORT = "/dev/cu.usbmodem11201"
+MV2_PORT = "/dev/cu.usbmodem11101"
 BAUD = 115200
 
 
 OUTPUT_DIR = Path("mv2_logs")
 OUTPUT_DIR.mkdir(exist_ok=True)
+
+# ---- HARDCODED SETTINGS ----
+AVG_WINDOW_S = 1.0
+SETTLE_AFTER_MOVE_S = 0.5
+FLUSH_TIME_S = 0.5
 
 
 # ---------- Serial ----------
@@ -67,35 +71,83 @@ def read_mv2_line(ser):
         return None
 
 
-def collect_mv2_samples(ser, duration_s, metadata, print_hz=1.0):
-    rows = []
-    start = time.time()
-    last_print = 0.0
-    print_interval = 1.0 / print_hz
+def flush_mv2_buffer(ser):
+    end = time.time() + FLUSH_TIME_S
+    while time.time() < end:
+        ser.reset_input_buffer()
+        time.sleep(0.02)
 
-    while time.time() - start < duration_s:
+
+def average_rows(window):
+    n = len(window)
+
+    avg = {
+        "pc_time_s": time.time(),
+        "t_ms": window[-1]["t_ms"],
+        "n_samples": n,
+    }
+
+    keys = [
+        "Bx_raw", "By_raw", "Bz_raw", "T_raw",
+        "Bx_mT", "By_mT", "Bz_mT", "Bmag_mT"
+    ]
+
+    for k in keys:
+        avg[k] = sum(r[k] for r in window) / n
+
+    return avg
+
+
+def collect_one_average(ser):
+    window = []
+    start = time.time()
+
+    while time.time() - start < AVG_WINDOW_S:
         row = read_mv2_line(ser)
 
-        if row is None:
-            continue
+        if row is not None:
+            window.append(row)
 
-        row.update(metadata)
-        rows.append(row)
+    if not window:
+        raise RuntimeError("No valid MV2 samples collected during averaging window")
 
-        now = time.time()
+    return average_rows(window)
 
-        if now - last_print >= print_interval:
-            print(
-                f"t={now-start:6.1f}s | "
-                f"|B|={row['Bmag_mT']:8.3f} mT | "
-                f"Bx={row['Bx_mT']:7.3f} "
-                f"By={row['By_mT']:7.3f} "
-                f"Bz={row['Bz_mT']:7.3f}"
-            )
-            last_print = now
+
+def collect_mv2_samples(ser, duration_s, metadata):
+    """
+    duration_s is kept as the prompt meaning:
+    Measurement time per step (s)
+
+    Since AVG_WINDOW_S = 1.0, this gives one averaged measurement per second.
+    Example:
+      duration_s = 5
+      -> 5 saved averaged rows
+    """
+    num_measurements = int(duration_s / AVG_WINDOW_S)
+    rows = []
+
+    flushed = collect_one_average(ser)
+    print(f"flushed first window ({flushed['n_samples']} samples)")
+
+    for measurement_index in range(num_measurements):
+        avg_row = collect_one_average(ser)
+
+        avg_row.update(metadata)
+        avg_row["measurement_index"] = measurement_index
+
+        rows.append(avg_row)
+
+        print(
+            f"measurement {measurement_index + 1}/{num_measurements} | "
+            f"avg over {avg_row['n_samples']:3d} samples | "
+            f"|B|={avg_row['Bmag_mT']:8.3f} mT | "
+            f"Bx={avg_row['Bx_mT']:7.3f} "
+            f"By={avg_row['By_mT']:7.3f} "
+            f"Bz={avg_row['Bz_mT']:7.3f}"
+        )
 
     return rows
-
 
 # ---------- Stepper ----------
 
@@ -131,7 +183,7 @@ def parse_sequence(text):
 
 def setup_mode(stepper_ser):
     print("\nSETUP MODE (motor only)")
-    print("Type commands like: ZERO, GOTO 1 90, MOVE 2 -10")
+    print("Commands: ZERO, GOTO, MOVE, etc.")
     print("Type 'back' to exit\n")
 
     while True:
@@ -140,10 +192,8 @@ def setup_mode(stepper_ser):
         if cmd in {"back", "exit", "q"}:
             return
 
-        if not cmd:
-            continue
-
-        print(send_stepper(stepper_ser, cmd))
+        if cmd:
+            print(send_stepper(stepper_ser, cmd))
 
 
 def manual_mode(stepper_ser, mv2_ser):
@@ -163,6 +213,8 @@ def manual_mode(stepper_ser, mv2_ser):
             parts = cmd.split()
             duration = float(parts[1]) if len(parts) > 1 else 2.0
 
+            flush_mv2_buffer(mv2_ser)
+
             collect_mv2_samples(
                 mv2_ser,
                 duration_s=duration,
@@ -178,8 +230,8 @@ def manual_mode(stepper_ser, mv2_ser):
 
 def auto_sweep_mode(stepper_ser, mv2_ser):
     print("\nAUTO SWEEP MODE")
+    print("Enter sequence (4 values per line). Blank line to finish:\n")
 
-    print("Enter sequence (4 values per line):")
     text = ""
     while True:
         line = input()
@@ -208,6 +260,9 @@ def auto_sweep_mode(stepper_ser, mv2_ser):
 
         move_to_angles(stepper_ser, angles)
 
+        time.sleep(SETTLE_AFTER_MOVE_S)
+        flush_mv2_buffer(mv2_ser)
+
         rows = collect_mv2_samples(
             mv2_ser,
             duration_s=dwell,
@@ -226,11 +281,82 @@ def auto_sweep_mode(stepper_ser, mv2_ser):
     if return_zero:
         print("\nReturning to zero...")
         move_to_angles(stepper_ser, [0, 0, 0, 0])
+    filtered_rows = []
+    for i in range(len(all_rows)):
+        if all_rows[i]["n_samples"] <= 70:
+            filtered_rows.append(all_rows[i])
 
-    write_csv(all_rows, filename)
+    write_csv(filtered_rows, filename)
 
     print("\nSweep complete\n")
 
+def auto_sweep_from_file(stepper_ser, mv2_ser):
+    print("\nAUTO SWEEP FROM FILE MODE")
+    filepath = input("Enter path to sequence file: ").strip()
+    if not filepath:
+        print("No file path provided")
+        return
+
+    try:
+        with open(filepath, "r") as f:
+            text = f.read()
+    except Exception as e:
+        print(f"Error reading file: {e}")
+        return
+
+    try:
+        sequence = parse_sequence(text)
+    except Exception as e:
+        print(f"Error parsing sequence: {e}")
+        return
+
+    dwell = input("Measurement time per step (s) [default 60]: ").strip()
+    dwell = float(dwell) if dwell else 60.0
+
+    return_zero = input("Return to zero at end? [Y/n]: ").lower() not in {"n", "no"}
+
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = OUTPUT_DIR / f"mv2_sweep_{run_id}.csv"
+
+    print(f"\nRunning sweep ({len(sequence)} steps)\n")
+
+    all_rows = []
+
+    send_stepper(stepper_ser, "ZERO")
+
+    for i, angles in enumerate(sequence):
+        print(f"\nStep {i+1}: {angles}")
+
+        move_to_angles(stepper_ser, angles)
+
+        time.sleep(SETTLE_AFTER_MOVE_S)
+        flush_mv2_buffer(mv2_ser)
+
+        rows = collect_mv2_samples(
+            mv2_ser,
+            duration_s=dwell,
+            metadata={
+                "run_id": run_id,
+                "step_index": i,
+                "m1_deg": angles[0],
+                "m2_deg": angles[1],
+                "m3_deg": angles[2],
+                "m4_deg": angles[3],
+            },
+        )
+
+        all_rows.extend(rows)
+
+    if return_zero:
+        print("\nReturning to zero...")
+        move_to_angles(stepper_ser, [0, 0, 0, 0])
+    
+    filtered_rows = []
+    for i in range(len(all_rows)):
+        if all_rows[i]["n_samples"] <= 70:
+            filtered_rows.append(all_rows[i])
+    write_csv(filtered_rows, filename)
+    print("\nSweep complete\n")
 
 # ---------- CSV ----------
 
@@ -260,6 +386,7 @@ def main():
             print("1: setup")
             print("2: manual")
             print("3: auto sweep")
+            print("4: auto sweep sequence from file")
             print("q: quit")
 
             choice = input("> ").strip().lower()
@@ -272,6 +399,8 @@ def main():
 
             elif choice == "3":
                 auto_sweep_mode(stepper_ser, mv2_ser)
+            elif choice == "4":
+                auto_sweep_from_file(stepper_ser, mv2_ser)
 
             elif choice in {"q", "quit"}:
                 print("Exiting")

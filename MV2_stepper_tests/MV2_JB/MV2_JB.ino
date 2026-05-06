@@ -43,10 +43,31 @@ bool waitForDataReady(unsigned long timeout_ms = 5) {
   return true;
 }
 
-float rawToMilliTesla(uint16_t raw) {
-  // For +/-300 mT range.
+float rawToMilliTesla(uint16_t raw, int axis) {
+  // For digital mode, +/-300 mT range.
+  // Uses typical datasheet sensitivity:
+  // X/Y = 91.2 LSB/mT, Z = 98.5 LSB/mT.
+  // Assumes zero-field code is 32768; actual zero may differ due to digital offset.
   // Approximate scaling: 0 -> -300 mT, 32768 -> 0 mT, 65535 -> +300 mT.
-  return ((float)raw - 32768.0f) * (300.0f / 32768.0f);
+  float sensitivity;
+
+  if (axis == 0 || axis == 1) {
+    sensitivity = 27.6f;  
+  } else if (axis == 2) {
+    sensitivity = 29.5f;  
+  } else {
+    return 0.0f;
+  }
+  return ((float)raw - 32768.0f) / sensitivity;
+}
+
+void flushMV2Sample() {
+  if (!waitForDataReady(20)) return;
+
+  spiWriteRead16(0x2C09); // Bx returned, select By
+  spiWriteRead16(0x2C0A); // By returned, select Bz
+  spiWriteRead16(0x2C0B); // Bz returned, select Temp
+  spiWriteRead16(0x2C08); // Temp returned, select Bx
 }
 
 void configureMV2Digital() {
@@ -68,7 +89,7 @@ void configureMV2Digital() {
   delay(10);
 
   // These commands are from MV2DigitalScript.xml
-  spiWriteRead16(0x2C04); // Register 0: 3-axis, 14-bit, +/-300 mT, select Bx
+  spiWriteRead16(0x2C08); // Register 0: 3-axis, 14-bit, +/-1000 mT, select Bx
   spiWriteRead16(0x2D02); // Register 1
   spiWriteRead16(0x2E08); // Register 2
 
@@ -90,14 +111,14 @@ void loop() {
 
   // Pipelined reads from MV2DigitalScript.xml:
   // send select next channel, receive previous channel.
-  uint16_t rawBx = spiWriteRead16(0x2C05); // read Bx, select By
-  uint16_t rawBy = spiWriteRead16(0x2C06); // read By, select Bz
-  uint16_t rawBz = spiWriteRead16(0x2C07); // read Bz, select Temp
-  uint16_t rawT  = spiWriteRead16(0x2C04); // read Temp, select Bx
+  uint16_t rawBx = spiWriteRead16(0x2C09); // read Bx, select By
+  uint16_t rawBy = spiWriteRead16(0x2C0A); // read By, select Bz
+  uint16_t rawBz = spiWriteRead16(0x2C0B); // read Bz, select Temp
+  uint16_t rawT  = spiWriteRead16(0x2C08); // read Temp, select Bx
 
-  float bx = rawToMilliTesla(rawBx);
-  float by = rawToMilliTesla(rawBy);
-  float bz = rawToMilliTesla(rawBz);
+  float bx = rawToMilliTesla(rawBx, 0);
+  float by = rawToMilliTesla(rawBy, 1);
+  float bz = rawToMilliTesla(rawBz, 2);
   float bmag = sqrt(bx * bx + by * by + bz * bz);
 
   Serial.print(millis());
